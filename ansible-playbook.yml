@@ -1,0 +1,102 @@
+---
+- name: Deploy two AWS EC2 nodes and set up the application
+  hosts: localhost
+  tasks:
+    - name: Launch build node in AWS
+      ec2:
+        key_name: mykey
+        instance_type: t2.micro
+        image: ami-123456
+        region: us-east-1
+        group: build-node-security-group
+        count: 1
+        instance_tags:
+          Name: build-node
+        wait: yes
+      register: build_node
+
+    - name: Launch production node in AWS
+      ec2:
+        key_name: mykey
+        instance_type: t2.micro
+        image: ami-1234567
+        region: us-east-1
+        group: production-node-security-group
+        count: 1
+        instance_tags:
+          Name: production-node
+        wait: yes
+      register: production_node
+
+    - name: Wait for SSH to become available on build node
+      wait_for:
+        host: "{{ build_node.instances[0].public_ip }}"
+        port: 22
+        delay: 10
+        timeout: 300
+
+    - name: Wait for SSH to become available on production node
+      wait_for:
+        host: "{{ production_node.instances[0].public_ip }}"
+        port: 22
+        delay: 10
+        timeout: 300
+
+- name: Set up and build on build node
+  hosts: all
+  vars:
+    ansible_user: ec2-user
+    ansible_ssh_private_key_file: key.pem # cause don't want to use SSH agent
+    repo_url: https://github.com/boxfuse/boxfuse-sample-java-war-hello
+  tasks:
+    - name: Install required packages
+      apt:
+        name:
+          - git
+          - openjdk-8-jdk
+          - maven
+        state: present
+
+    - name: Clone repository
+      git:
+        repo: "{{ repo_url }}"
+        dest: /home/ec2-user/app
+
+    - name: Build the project
+      command: mvn clean package -T 2C -DskipTests
+      args:
+        chdir: /home/ec2-user/app
+
+    - name: Copy WAR file to local controller
+      fetch:
+        src: /home/ec2-user/app/target/boxfuse-*.war
+        dest: ./boxfuse.war
+        flat: yes
+
+- name: Deploy and run on production node
+  hosts: all
+  vars:
+    ansible_user: ec2-user
+    ansible_ssh_private_key_file: key.pem
+  tasks:
+    - name: Install Java
+      apt:
+        name: openjdk-8-jre
+        state: present
+
+    - name: Copy WAR file to production node
+      copy:
+        src: ./boxfuse.war
+        dest: /home/ec2-user/boxfuse.war
+
+    - name: Run WAR with embedded server
+      command: java -jar /home/ec2-user/boxfuse.war
+      async: 60
+      poll: 0
+      ignore_errors: true
+
+    - name: Ensure application is running
+      wait_for:
+        host: "{{ ansible_host }}"
+        port: 8080
+        timeout: 300
